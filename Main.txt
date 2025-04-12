@@ -1,0 +1,391 @@
+final code swin versus resnet (win: Swin Transformer Base (Swin-B), microsoft/swin-base-patch4-window7-224-in22k, pre-trained on ImageNet-22k.
+ResNet: ResNet-50, pre-trained on ImageNet-1k with ResNet50_Weights.IMAGENET1K_V2 weights.):
+
+import torch
+import torchvision.transforms as transforms
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, random_split
+from transformers import SwinForImageClassification, SwinConfig
+from torchvision.models import resnet50, ResNet50_Weights
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+from statsmodels.stats.contingency_tables import mcnemar
+from PIL import Image
+import os
+import kagglehub
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import random
+import copy
+import warnings
+warnings.filterwarnings('ignore')
+
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Set seeds for reproducibility
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_seed()
+
+# Dataset paths
+dataset_path = kagglehub.dataset_download("hasnainjaved/melanoma-skin-cancer-dataset-of-10000-images")
+TRAIN_DIR = os.path.join(dataset_path, "melanoma_cancer_dataset", "train")
+TEST_DIR = os.path.join(dataset_path, "melanoma_cancer_dataset", "test")
+
+# Data transforms
+train_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(30),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.2),
+    transforms.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1), shear=10),
+    transforms.RandomPerspective(p=0.3),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+val_test_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# MelanomaDataset class with quality check
+class MelanomaDataset(Dataset):
+    def __init__(self, directory, transform=None, oversampling_factor=1.0):
+        self.directory = directory
+        self.transform = transform
+        self.images = []
+        self.labels = []
+        benign_count = 0
+        malignant_count = 0
+        skipped = 0
+
+        for label in ['benign', 'malignant']:
+            path = os.path.join(directory, label)
+            for img in os.listdir(path):
+                img_path = os.path.join(path, img)
+                try:
+                    with Image.open(img_path) as temp_img:
+                        temp_img.verify()
+                    self.images.append((img_path, 1 if label == 'malignant' else 0))
+                    if label == 'benign':
+                        benign_count += 1
+                    else:
+                        malignant_count += 1
+                except (IOError, SyntaxError):
+                    skipped += 1
+                    continue
+
+        if oversampling_factor > 1 and malignant_count > 0:
+            malignant_images = [img for img in self.images if img[1] == 1]
+            self.images.extend(malignant_images * (int(oversampling_factor) - 1))
+            self.labels.extend([1] * len(malignant_images) * (int(oversampling_factor) - 1))
+
+        self.labels = [img[1] for img in self.images]
+        print(f"Dataset created with {len(self.images)} images, {skipped} skipped due to corruption")
+        print(f"Original distribution - Benign: {benign_count}, Malignant: {malignant_count}")
+        print(f"After oversampling - Class distribution: {np.bincount(self.labels)}")
+        self.class_weights = torch.tensor([1.0 / count for count in np.bincount(self.labels)], dtype=torch.float).to(device)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path, label = self.images[idx]
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+# EnhancedLoss class
+class EnhancedLoss(nn.Module):
+    def __init__(self, class_weights):
+        super().__init__()
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    def forward(self, outputs, targets):
+        return self.criterion(outputs, targets)
+
+# ImprovedSwinModel class
+class ImprovedSwinModel(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        config = SwinConfig.from_pretrained('microsoft/swin-base-patch4-window7-224-in22k')
+        self.swin = SwinForImageClassification.from_pretrained('microsoft/swin-base-patch4-window7-224-in22k', config=config, ignore_mismatched_sizes=True)
+        self.swin.classifier = nn.Linear(self.swin.classifier.in_features, num_classes)
+
+    def forward(self, x):
+        return self.swin(x).logits
+
+# ResNet50Model class
+class ResNet50Model(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        self.resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        self.resnet.fc = nn.Linear(self.resnet.fc.in_features, num_classes)
+
+    def forward(self, x):
+        return self.resnet(x)
+
+# Train model function (simplified without resume)
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=20, patience=10, model_name="swin"):
+    best_val_loss = float('inf')
+    best_model_wts = copy.deepcopy(model.state_dict())
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'val_precision': [], 'val_recall': [], 'val_f1': [], 'val_auc': []}
+    patience_counter = 0
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss, train_correct, train_total = 0, 0, 0
+        for images, labels in tqdm(train_loader, desc=f"Training {model_name} Epoch {epoch+1}"):
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            _, preds = torch.max(outputs, 1)
+            train_correct += (preds == labels).sum().item()
+            train_total += labels.size(0)
+
+        train_loss /= len(train_loader)
+        train_acc = train_correct / train_total
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+
+        model.eval()
+        val_loss, val_correct, val_total = 0, 0, 0
+        all_preds, all_labels, all_probs = [], [], []
+        with torch.no_grad():
+            for images, labels in tqdm(val_loader, desc=f"Validating {model_name}"):
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                _, preds = torch.max(outputs, 1)
+                probs = torch.softmax(outputs, dim=1)[:, 1]
+                val_correct += (preds == labels).sum().item()
+                val_total += labels.size(0)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
+
+        val_loss /= len(val_loader)
+        val_acc = val_correct / val_total
+        val_precision = precision_score(all_labels, all_preds)
+        val_recall = recall_score(all_labels, all_preds)
+        val_f1 = f1_score(all_labels, all_preds)
+        val_auc = roc_auc_score(all_labels, all_probs)
+
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['val_precision'].append(val_precision)
+        history['val_recall'].append(val_recall)
+        history['val_f1'].append(val_f1)
+        history['val_auc'].append(val_auc)
+
+        print(f"Epoch {epoch+1}/{num_epochs} ({model_name.upper()})")
+        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"Val Precision: {val_precision:.4f}, Val Recall: {val_recall:.4f}")
+        print(f"Val F1: {val_f1:.4f}, Val AUC: {val_auc:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_wts = copy.deepcopy(model.state_dict())
+            torch.save(best_model_wts, f"best_model_{model_name}.pth")
+            print(f"Saved best {model_name} model with Val Loss: {best_val_loss:.4f}")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping triggered for {model_name} after {patience} epochs.")
+            break
+
+        scheduler.step(val_loss)
+
+    model.load_state_dict(best_model_wts)
+    return model, history, {'val_loss': best_val_loss, 'val_acc': val_acc, 'val_precision': val_precision, 'val_recall': val_recall, 'val_f1': val_f1, 'val_auc': val_auc}
+
+# Evaluate model function
+def evaluate_model(model, test_loader, model_name="swin"):
+    model.eval()
+    all_preds, all_labels, all_probs = [], [], []
+
+    with torch.no_grad():
+        for images, labels in tqdm(test_loader, desc=f"Evaluating {model_name}"):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            probs = torch.softmax(outputs, dim=1)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy())
+
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds)
+    recall = recall_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds)
+    auc_roc = roc_auc_score(all_labels, all_probs)
+
+    cm = confusion_matrix(all_labels, all_preds)
+    print(f"\nConfusion Matrix ({model_name.upper()}):")
+    print(cm)
+    print(f"\nMetrics with default threshold (0.5) for {model_name.upper()}:")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"AUC-ROC: {auc_roc:.4f}")
+
+    thresholds = [0.3, 0.4, 0.5, 0.6, 0.7]
+    best_f1, best_threshold = 0, 0.5
+    best_metrics = {}
+    print(f"\nPerformance at different thresholds ({model_name.upper()}):")
+    print("Threshold\tAccuracy\tPrecision\tRecall\tF1 Score")
+    print("-" * 70)
+
+    for t in thresholds:
+        binary_preds = [1 if p >= t else 0 for p in all_probs]
+        t_accuracy = accuracy_score(all_labels, binary_preds)
+        t_precision = precision_score(all_labels, binary_preds)
+        t_recall = recall_score(all_labels, binary_preds)
+        t_f1 = f1_score(all_labels, binary_preds)
+        print(f"{t:.1f}\t\t{t_accuracy:.4f}\t\t{t_precision:.4f}\t\t{t_recall:.4f}\t{t_f1:.4f}")
+        if t_f1 > best_f1:
+            best_f1 = t_f1
+            best_threshold = t
+            best_metrics = {'accuracy': t_accuracy, 'precision': t_precision, 'recall': t_recall, 'f1_score': t_f1, 'auc_roc': auc_roc, 'threshold': t}
+
+    print(f"\nBest threshold for {model_name.upper()}: {best_threshold:.1f} with F1={best_f1:.4f}")
+    return {'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1_score': f1, 'auc_roc': auc_roc, 'threshold': 0.5}, best_metrics, all_preds, all_labels
+
+# Plot training history
+def plot_training_history(history, model_name="swin"):
+    plt.figure(figsize=(15, 10))
+    plt.subplot(2, 2, 1)
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title(f'{model_name.upper()} Loss')
+
+    plt.subplot(2, 2, 2)
+    plt.plot(history['train_acc'], label='Train Accuracy')
+    plt.plot(history['val_acc'], label='Val Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.title(f'{model_name.upper()} Accuracy')
+
+    plt.subplot(2, 2, 3)
+    plt.plot(history['val_precision'], label='Precision')
+    plt.plot(history['val_recall'], label='Recall')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.title(f'{model_name.upper()} Precision and Recall')
+
+    plt.subplot(2, 2, 4)
+    plt.plot(history['val_f1'], label='F1 Score')
+    plt.plot(history['val_auc'], label='AUC-ROC')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.title(f'{model_name.upper()} F1 and AUC-ROC')
+
+    plt.tight_layout()
+    plt.savefig(f'training_history_{model_name}.png')
+    plt.close()
+
+# Main function
+def main():
+    try:
+        print("\n=== Melanoma Classification ===\n")
+        print("Loading datasets...")
+        full_dataset = MelanomaDataset(TRAIN_DIR, transform=train_transform, oversampling_factor=2.0)
+        test_dataset = MelanomaDataset(TEST_DIR, transform=val_test_transform, oversampling_factor=1.0)
+
+        # Single train/val split
+        train_size = int(0.8 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4)
+        test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=4)
+
+        # Swin Transformer
+        swin_model = ImprovedSwinModel(num_classes=2).to(device)
+        criterion = EnhancedLoss(class_weights=full_dataset.class_weights)
+        optimizer = optim.AdamW(swin_model.parameters(), lr=1e-4, weight_decay=1e-2)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+        swin_model, swin_history, swin_best_metrics = train_model(
+            swin_model, train_loader, val_loader, criterion, optimizer, scheduler, model_name="swin"
+        )
+        plot_training_history(swin_history, "swin")
+
+        # ResNet-50
+        resnet_model = ResNet50Model(num_classes=2).to(device)
+        optimizer = optim.AdamW(resnet_model.parameters(), lr=1e-4, weight_decay=1e-2)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+        resnet_model, resnet_history, resnet_best_metrics = train_model(
+            resnet_model, train_loader, val_loader, criterion, optimizer, scheduler, model_name="resnet"
+        )
+        plot_training_history(resnet_history, "resnet")
+
+        # Final evaluation on test set
+        print("\n=== Evaluation Phase ===\n")
+        swin_std_metrics, swin_best_metrics, swin_preds, swin_labels = evaluate_model(swin_model, test_loader, "swin")
+        resnet_std_metrics, resnet_best_metrics, resnet_preds, resnet_labels = evaluate_model(resnet_model, test_loader, "resnet")
+
+        # Statistical significance (McNemar's test)
+        contingency_table = np.array([
+            [sum((np.array(swin_preds) == np.array(swin_labels)) & (np.array(resnet_preds) == np.array(resnet_labels))),
+             sum((np.array(swin_preds) == np.array(swin_labels)) & (np.array(resnet_preds) != np.array(resnet_labels)))],
+            [sum((np.array(swin_preds) != np.array(swin_labels)) & (np.array(resnet_preds) == np.array(resnet_labels))),
+             sum((np.array(swin_preds) != np.array(swin_labels)) & (np.array(resnet_preds) != np.array(resnet_labels)))]
+        ])
+        result = mcnemar(contingency_table, correction=True)
+        print(f"\nMcNemar's Test (Swin vs. ResNet): p-value = {result.pvalue:.4f}")
+        if result.pvalue < 0.05:
+            print("Significant difference between Swin and ResNet predictions.")
+        else:
+            print("No significant difference between Swin and ResNet predictions.")
+
+        # Final results
+        print("\n=== Final Model Performance ===")
+        for model_name, std_metrics, best_metrics in [("Swin", swin_std_metrics, swin_best_metrics), ("ResNet", resnet_std_metrics, resnet_best_metrics)]:
+            print(f"\n{model_name.upper()} Default threshold (0.5):")
+            for key, value in std_metrics.items():
+                print(f"  {key}: {value:.4f}")
+            print(f"\n{model_name.upper()} Optimal threshold ({best_metrics['threshold']:.1f}):")
+            for key, value in best_metrics.items():
+                print(f"  {key}: {value:.4f}")
+
+        print("\nMelanoma classification completed successfully!")
+
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
+
