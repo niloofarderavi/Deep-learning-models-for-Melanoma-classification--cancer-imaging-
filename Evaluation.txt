@@ -1,0 +1,798 @@
+final code swin versus resnet (win: Swin Transformer Base (Swin-B), microsoft/swin-base-patch4-window7-224-in22k, pre-trained on ImageNet-22k.
+ResNet: ResNet-50, pre-trained on ImageNet-1k with ResNet50_Weights.IMAGENET1K_V2 weights.):
+
+import torch
+import torchvision.transforms as transforms
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, random_split
+from transformers import SwinForImageClassification, SwinConfig
+from torchvision.models import resnet50, ResNet50_Weights
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+from statsmodels.stats.contingency_tables import mcnemar
+from PIL import Image
+import os
+import kagglehub
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import random
+import copy
+import warnings
+warnings.filterwarnings('ignore')
+
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Set seeds for reproducibility
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_seed()
+
+# Dataset paths
+dataset_path = kagglehub.dataset_download("hasnainjaved/melanoma-skin-cancer-dataset-of-10000-images")
+TRAIN_DIR = os.path.join(dataset_path, "melanoma_cancer_dataset", "train")
+TEST_DIR = os.path.join(dataset_path, "melanoma_cancer_dataset", "test")
+
+# Data transforms
+train_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(30),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.2),
+    transforms.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1), shear=10),
+    transforms.RandomPerspective(p=0.3),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+val_test_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# MelanomaDataset class with quality check
+class MelanomaDataset(Dataset):
+    def __init__(self, directory, transform=None, oversampling_factor=1.0):
+        self.directory = directory
+        self.transform = transform
+        self.images = []
+        self.labels = []
+        benign_count = 0
+        malignant_count = 0
+        skipped = 0
+
+        for label in ['benign', 'malignant']:
+            path = os.path.join(directory, label)
+            for img in os.listdir(path):
+                img_path = os.path.join(path, img)
+                try:
+                    with Image.open(img_path) as temp_img:
+                        temp_img.verify()
+                    self.images.append((img_path, 1 if label == 'malignant' else 0))
+                    if label == 'benign':
+                        benign_count += 1
+                    else:
+                        malignant_count += 1
+                except (IOError, SyntaxError):
+                    skipped += 1
+                    continue
+
+        if oversampling_factor > 1 and malignant_count > 0:
+            malignant_images = [img for img in self.images if img[1] == 1]
+            self.images.extend(malignant_images * (int(oversampling_factor) - 1))
+            self.labels.extend([1] * len(malignant_images) * (int(oversampling_factor) - 1))
+
+        self.labels = [img[1] for img in self.images]
+        print(f"Dataset created with {len(self.images)} images, {skipped} skipped due to corruption")
+        print(f"Original distribution - Benign: {benign_count}, Malignant: {malignant_count}")
+        print(f"After oversampling - Class distribution: {np.bincount(self.labels)}")
+        self.class_weights = torch.tensor([1.0 / count for count in np.bincount(self.labels)], dtype=torch.float).to(device)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path, label = self.images[idx]
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+# EnhancedLoss class
+class EnhancedLoss(nn.Module):
+    def __init__(self, class_weights):
+        super().__init__()
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    def forward(self, outputs, targets):
+        return self.criterion(outputs, targets)
+
+# ImprovedSwinModel class
+class ImprovedSwinModel(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        config = SwinConfig.from_pretrained('microsoft/swin-base-patch4-window7-224-in22k')
+        self.swin = SwinForImageClassification.from_pretrained('microsoft/swin-base-patch4-window7-224-in22k', config=config, ignore_mismatched_sizes=True)
+        self.swin.classifier = nn.Linear(self.swin.classifier.in_features, num_classes)
+
+    def forward(self, x):
+        return self.swin(x).logits
+
+# ResNet50Model class
+class ResNet50Model(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        self.resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        self.resnet.fc = nn.Linear(self.resnet.fc.in_features, num_classes)
+
+    def forward(self, x):
+        return self.resnet(x)
+
+# Train model function (simplified without resume)
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=20, patience=10, model_name="swin"):
+    best_val_loss = float('inf')
+    best_model_wts = copy.deepcopy(model.state_dict())
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'val_precision': [], 'val_recall': [], 'val_f1': [], 'val_auc': []}
+    patience_counter = 0
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss, train_correct, train_total = 0, 0, 0
+        for images, labels in tqdm(train_loader, desc=f"Training {model_name} Epoch {epoch+1}"):
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            _, preds = torch.max(outputs, 1)
+            train_correct += (preds == labels).sum().item()
+            train_total += labels.size(0)
+
+        train_loss /= len(train_loader)
+        train_acc = train_correct / train_total
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+
+        model.eval()
+        val_loss, val_correct, val_total = 0, 0, 0
+        all_preds, all_labels, all_probs = [], [], []
+        with torch.no_grad():
+            for images, labels in tqdm(val_loader, desc=f"Validating {model_name}"):
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                _, preds = torch.max(outputs, 1)
+                probs = torch.softmax(outputs, dim=1)[:, 1]
+                val_correct += (preds == labels).sum().item()
+                val_total += labels.size(0)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
+
+        val_loss /= len(val_loader)
+        val_acc = val_correct / val_total
+        val_precision = precision_score(all_labels, all_preds)
+        val_recall = recall_score(all_labels, all_preds)
+        val_f1 = f1_score(all_labels, all_preds)
+        val_auc = roc_auc_score(all_labels, all_probs)
+
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['val_precision'].append(val_precision)
+        history['val_recall'].append(val_recall)
+        history['val_f1'].append(val_f1)
+        history['val_auc'].append(val_auc)
+
+        print(f"Epoch {epoch+1}/{num_epochs} ({model_name.upper()})")
+        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"Val Precision: {val_precision:.4f}, Val Recall: {val_recall:.4f}")
+        print(f"Val F1: {val_f1:.4f}, Val AUC: {val_auc:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_wts = copy.deepcopy(model.state_dict())
+            torch.save(best_model_wts, f"best_model_{model_name}.pth")
+            print(f"Saved best {model_name} model with Val Loss: {best_val_loss:.4f}")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping triggered for {model_name} after {patience} epochs.")
+            break
+
+        scheduler.step(val_loss)
+
+    model.load_state_dict(best_model_wts)
+    return model, history, {'val_loss': best_val_loss, 'val_acc': val_acc, 'val_precision': val_precision, 'val_recall': val_recall, 'val_f1': val_f1, 'val_auc': val_auc}
+
+# Evaluate model function
+def evaluate_model(model, test_loader, model_name="swin"):
+    model.eval()
+    all_preds, all_labels, all_probs = [], [], []
+
+    with torch.no_grad():
+        for images, labels in tqdm(test_loader, desc=f"Evaluating {model_name}"):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            probs = torch.softmax(outputs, dim=1)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy())
+
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds)
+    recall = recall_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds)
+    auc_roc = roc_auc_score(all_labels, all_probs)
+
+    cm = confusion_matrix(all_labels, all_preds)
+    print(f"\nConfusion Matrix ({model_name.upper()}):")
+    print(cm)
+    print(f"\nMetrics with default threshold (0.5) for {model_name.upper()}:")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"AUC-ROC: {auc_roc:.4f}")
+
+    thresholds = [0.3, 0.4, 0.5, 0.6, 0.7]
+    best_f1, best_threshold = 0, 0.5
+    best_metrics = {}
+    print(f"\nPerformance at different thresholds ({model_name.upper()}):")
+    print("Threshold\tAccuracy\tPrecision\tRecall\tF1 Score")
+    print("-" * 70)
+
+    for t in thresholds:
+        binary_preds = [1 if p >= t else 0 for p in all_probs]
+        t_accuracy = accuracy_score(all_labels, binary_preds)
+        t_precision = precision_score(all_labels, binary_preds)
+        t_recall = recall_score(all_labels, binary_preds)
+        t_f1 = f1_score(all_labels, binary_preds)
+        print(f"{t:.1f}\t\t{t_accuracy:.4f}\t\t{t_precision:.4f}\t\t{t_recall:.4f}\t{t_f1:.4f}")
+        if t_f1 > best_f1:
+            best_f1 = t_f1
+            best_threshold = t
+            best_metrics = {'accuracy': t_accuracy, 'precision': t_precision, 'recall': t_recall, 'f1_score': t_f1, 'auc_roc': auc_roc, 'threshold': t}
+
+    print(f"\nBest threshold for {model_name.upper()}: {best_threshold:.1f} with F1={best_f1:.4f}")
+    return {'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1_score': f1, 'auc_roc': auc_roc, 'threshold': 0.5}, best_metrics, all_preds, all_labels
+
+# Plot training history
+def plot_training_history(history, model_name="swin"):
+    plt.figure(figsize=(15, 10))
+    plt.subplot(2, 2, 1)
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title(f'{model_name.upper()} Loss')
+
+    plt.subplot(2, 2, 2)
+    plt.plot(history['train_acc'], label='Train Accuracy')
+    plt.plot(history['val_acc'], label='Val Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.title(f'{model_name.upper()} Accuracy')
+
+    plt.subplot(2, 2, 3)
+    plt.plot(history['val_precision'], label='Precision')
+    plt.plot(history['val_recall'], label='Recall')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.title(f'{model_name.upper()} Precision and Recall')
+
+    plt.subplot(2, 2, 4)
+    plt.plot(history['val_f1'], label='F1 Score')
+    plt.plot(history['val_auc'], label='AUC-ROC')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.title(f'{model_name.upper()} F1 and AUC-ROC')
+
+    plt.tight_layout()
+    plt.savefig(f'training_history_{model_name}.png')
+    plt.close()
+
+# Main function
+def main():
+    try:
+        print("\n=== Melanoma Classification ===\n")
+        print("Loading datasets...")
+        full_dataset = MelanomaDataset(TRAIN_DIR, transform=train_transform, oversampling_factor=2.0)
+        test_dataset = MelanomaDataset(TEST_DIR, transform=val_test_transform, oversampling_factor=1.0)
+
+        # Single train/val split
+        train_size = int(0.8 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4)
+        test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=4)
+
+        # Swin Transformer
+        swin_model = ImprovedSwinModel(num_classes=2).to(device)
+        criterion = EnhancedLoss(class_weights=full_dataset.class_weights)
+        optimizer = optim.AdamW(swin_model.parameters(), lr=1e-4, weight_decay=1e-2)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+        swin_model, swin_history, swin_best_metrics = train_model(
+            swin_model, train_loader, val_loader, criterion, optimizer, scheduler, model_name="swin"
+        )
+        plot_training_history(swin_history, "swin")
+
+        # ResNet-50
+        resnet_model = ResNet50Model(num_classes=2).to(device)
+        optimizer = optim.AdamW(resnet_model.parameters(), lr=1e-4, weight_decay=1e-2)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+        resnet_model, resnet_history, resnet_best_metrics = train_model(
+            resnet_model, train_loader, val_loader, criterion, optimizer, scheduler, model_name="resnet"
+        )
+        plot_training_history(resnet_history, "resnet")
+
+        # Final evaluation on test set
+        print("\n=== Evaluation Phase ===\n")
+        swin_std_metrics, swin_best_metrics, swin_preds, swin_labels = evaluate_model(swin_model, test_loader, "swin")
+        resnet_std_metrics, resnet_best_metrics, resnet_preds, resnet_labels = evaluate_model(resnet_model, test_loader, "resnet")
+
+        # Statistical significance (McNemar's test)
+        contingency_table = np.array([
+            [sum((np.array(swin_preds) == np.array(swin_labels)) & (np.array(resnet_preds) == np.array(resnet_labels))),
+             sum((np.array(swin_preds) == np.array(swin_labels)) & (np.array(resnet_preds) != np.array(resnet_labels)))],
+            [sum((np.array(swin_preds) != np.array(swin_labels)) & (np.array(resnet_preds) == np.array(resnet_labels))),
+             sum((np.array(swin_preds) != np.array(swin_labels)) & (np.array(resnet_preds) != np.array(resnet_labels)))]
+        ])
+        result = mcnemar(contingency_table, correction=True)
+        print(f"\nMcNemar's Test (Swin vs. ResNet): p-value = {result.pvalue:.4f}")
+        if result.pvalue < 0.05:
+            print("Significant difference between Swin and ResNet predictions.")
+        else:
+            print("No significant difference between Swin and ResNet predictions.")
+
+        # Final results
+        print("\n=== Final Model Performance ===")
+        for model_name, std_metrics, best_metrics in [("Swin", swin_std_metrics, swin_best_metrics), ("ResNet", resnet_std_metrics, resnet_best_metrics)]:
+            print(f"\n{model_name.upper()} Default threshold (0.5):")
+            for key, value in std_metrics.items():
+                print(f"  {key}: {value:.4f}")
+            print(f"\n{model_name.upper()} Optimal threshold ({best_metrics['threshold']:.1f}):")
+            for key, value in best_metrics.items():
+                print(f"  {key}: {value:.4f}")
+
+        print("\nMelanoma classification completed successfully!")
+
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
+
+evaluations:
+Using device: cuda
+
+=== Melanoma Classification ===
+
+Loading datasets...
+Dataset created with 14210 images, 0 skipped due to corruption
+Original distribution - Benign: 5000, Malignant: 4605
+After oversampling - Class distribution: [5000 9210]
+Dataset created with 1000 images, 0 skipped due to corruption
+Original distribution - Benign: 500, Malignant: 500
+After oversampling - Class distribution: [500 500]
+config.json: 100%
+ 1.67M/1.67M [00:00<00:00, 3.82MB/s]
+model.safetensors: 100%
+ 437M/437M [00:01<00:00, 496MB/s]
+Training swin Epoch 1: 100%|██████████| 711/711 [02:55<00:00,  4.05it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.11it/s]
+Epoch 1/20 (SWIN)
+Train Loss: 0.2624, Train Acc: 0.8861
+Val Loss: 0.2358, Val Acc: 0.8839
+Val Precision: 0.9822, Val Recall: 0.8363
+Val F1: 0.9034, Val AUC: 0.9729
+Saved best swin model with Val Loss: 0.2358
+Training swin Epoch 2: 100%|██████████| 711/711 [02:54<00:00,  4.08it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.10it/s]
+Epoch 2/20 (SWIN)
+Train Loss: 0.2050, Train Acc: 0.9113
+Val Loss: 0.2007, Val Acc: 0.9212
+Val Precision: 0.9608, Val Recall: 0.9160
+Val F1: 0.9378, Val AUC: 0.9766
+Saved best swin model with Val Loss: 0.2007
+Training swin Epoch 3: 100%|██████████| 711/711 [02:54<00:00,  4.08it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.13it/s]
+Epoch 3/20 (SWIN)
+Train Loss: 0.1920, Train Acc: 0.9148
+Val Loss: 0.1831, Val Acc: 0.9236
+Val Precision: 0.9594, Val Recall: 0.9214
+Val F1: 0.9400, Val AUC: 0.9793
+Saved best swin model with Val Loss: 0.1831
+Training swin Epoch 4: 100%|██████████| 711/711 [02:54<00:00,  4.08it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.08it/s]
+Epoch 4/20 (SWIN)
+Train Loss: 0.1829, Train Acc: 0.9195
+Val Loss: 0.2332, Val Acc: 0.8973
+Val Precision: 0.9850, Val Recall: 0.8547
+Val F1: 0.9153, Val AUC: 0.9752
+Training swin Epoch 5: 100%|██████████| 711/711 [02:54<00:00,  4.08it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.09it/s]
+Epoch 5/20 (SWIN)
+Train Loss: 0.1713, Train Acc: 0.9280
+Val Loss: 0.1793, Val Acc: 0.9251
+Val Precision: 0.9722, Val Recall: 0.9106
+Val F1: 0.9404, Val AUC: 0.9798
+Saved best swin model with Val Loss: 0.1793
+Training swin Epoch 6: 100%|██████████| 711/711 [02:54<00:00,  4.08it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.11it/s]
+Epoch 6/20 (SWIN)
+Train Loss: 0.1662, Train Acc: 0.9276
+Val Loss: 0.1767, Val Acc: 0.9303
+Val Precision: 0.9639, Val Recall: 0.9274
+Val F1: 0.9453, Val AUC: 0.9820
+Saved best swin model with Val Loss: 0.1767
+Training swin Epoch 7: 100%|██████████| 711/711 [02:54<00:00,  4.08it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.08it/s]
+Epoch 7/20 (SWIN)
+Train Loss: 0.1680, Train Acc: 0.9252
+Val Loss: 0.2089, Val Acc: 0.9152
+Val Precision: 0.9531, Val Recall: 0.9144
+Val F1: 0.9333, Val AUC: 0.9742
+Training swin Epoch 8: 100%|██████████| 711/711 [02:54<00:00,  4.07it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.10it/s]
+Epoch 8/20 (SWIN)
+Train Loss: 0.1588, Train Acc: 0.9324
+Val Loss: 0.1732, Val Acc: 0.9279
+Val Precision: 0.9702, Val Recall: 0.9171
+Val F1: 0.9429, Val AUC: 0.9831
+Saved best swin model with Val Loss: 0.1732
+Training swin Epoch 9: 100%|██████████| 711/711 [02:54<00:00,  4.09it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.12it/s]
+Epoch 9/20 (SWIN)
+Train Loss: 0.1503, Train Acc: 0.9334
+Val Loss: 0.1657, Val Acc: 0.9335
+Val Precision: 0.9662, Val Recall: 0.9301
+Val F1: 0.9478, Val AUC: 0.9832
+Saved best swin model with Val Loss: 0.1657
+Training swin Epoch 10: 100%|██████████| 711/711 [02:54<00:00,  4.09it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.13it/s]
+Epoch 10/20 (SWIN)
+Train Loss: 0.1525, Train Acc: 0.9317
+Val Loss: 0.2077, Val Acc: 0.9331
+Val Precision: 0.9534, Val Recall: 0.9431
+Val F1: 0.9482, Val AUC: 0.9830
+Training swin Epoch 11: 100%|██████████| 711/711 [02:54<00:00,  4.08it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.12it/s]
+Epoch 11/20 (SWIN)
+Train Loss: 0.1484, Train Acc: 0.9334
+Val Loss: 0.2021, Val Acc: 0.9075
+Val Precision: 0.9765, Val Recall: 0.8786
+Val F1: 0.9250, Val AUC: 0.9800
+Training swin Epoch 12: 100%|██████████| 711/711 [02:54<00:00,  4.08it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.10it/s]
+Epoch 12/20 (SWIN)
+Train Loss: 0.1412, Train Acc: 0.9384
+Val Loss: 0.1631, Val Acc: 0.9289
+Val Precision: 0.9790, Val Recall: 0.9100
+Val F1: 0.9433, Val AUC: 0.9827
+Saved best swin model with Val Loss: 0.1631
+Training swin Epoch 13: 100%|██████████| 711/711 [02:53<00:00,  4.09it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.15it/s]
+Epoch 13/20 (SWIN)
+Train Loss: 0.1401, Train Acc: 0.9387
+Val Loss: 0.1816, Val Acc: 0.9103
+Val Precision: 0.9883, Val Recall: 0.8721
+Val F1: 0.9266, Val AUC: 0.9822
+Training swin Epoch 14: 100%|██████████| 711/711 [02:53<00:00,  4.10it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.15it/s]
+Epoch 14/20 (SWIN)
+Train Loss: 0.1356, Train Acc: 0.9396
+Val Loss: 0.1609, Val Acc: 0.9296
+Val Precision: 0.9774, Val Recall: 0.9127
+Val F1: 0.9439, Val AUC: 0.9845
+Saved best swin model with Val Loss: 0.1609
+Training swin Epoch 15: 100%|██████████| 711/711 [02:54<00:00,  4.09it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.14it/s]
+Epoch 15/20 (SWIN)
+Train Loss: 0.1365, Train Acc: 0.9431
+Val Loss: 0.2066, Val Acc: 0.8867
+Val Precision: 0.9891, Val Recall: 0.8347
+Val F1: 0.9053, Val AUC: 0.9822
+Training swin Epoch 16: 100%|██████████| 711/711 [02:53<00:00,  4.09it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.10it/s]
+Epoch 16/20 (SWIN)
+Train Loss: 0.1313, Train Acc: 0.9441
+Val Loss: 0.1645, Val Acc: 0.9198
+Val Precision: 0.9833, Val Recall: 0.8916
+Val F1: 0.9352, Val AUC: 0.9840
+Training swin Epoch 17: 100%|██████████| 711/711 [02:53<00:00,  4.10it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.10it/s]
+Epoch 17/20 (SWIN)
+Train Loss: 0.1333, Train Acc: 0.9433
+Val Loss: 0.1527, Val Acc: 0.9286
+Val Precision: 0.9751, Val Recall: 0.9133
+Val F1: 0.9432, Val AUC: 0.9857
+Saved best swin model with Val Loss: 0.1527
+Training swin Epoch 18: 100%|██████████| 711/711 [02:53<00:00,  4.09it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.16it/s]
+Epoch 18/20 (SWIN)
+Train Loss: 0.1266, Train Acc: 0.9453
+Val Loss: 0.1542, Val Acc: 0.9388
+Val Precision: 0.9588, Val Recall: 0.9463
+Val F1: 0.9525, Val AUC: 0.9864
+Training swin Epoch 19: 100%|██████████| 711/711 [02:53<00:00,  4.09it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.14it/s]
+Epoch 19/20 (SWIN)
+Train Loss: 0.1235, Train Acc: 0.9457
+Val Loss: 0.1687, Val Acc: 0.9166
+Val Precision: 0.9861, Val Recall: 0.8840
+Val F1: 0.9323, Val AUC: 0.9853
+Training swin Epoch 20: 100%|██████████| 711/711 [02:53<00:00,  4.09it/s]
+Validating swin: 100%|██████████| 178/178 [00:14<00:00, 12.12it/s]
+Epoch 20/20 (SWIN)
+Train Loss: 0.1169, Train Acc: 0.9500
+Val Loss: 0.1574, Val Acc: 0.9338
+Val Precision: 0.9721, Val Recall: 0.9247
+Val F1: 0.9478, Val AUC: 0.9848
+Downloading: "https://download.pytorch.org/models/resnet50-11ad3fa6.pth" to /root/.cache/torch/hub/checkpoints/resnet50-11ad3fa6.pth
+100%|██████████| 97.8M/97.8M [00:00<00:00, 225MB/s]
+Training resnet Epoch 1: 100%|██████████| 711/711 [00:36<00:00, 19.55it/s]
+Validating resnet: 100%|██████████| 178/178 [00:09<00:00, 19.76it/s]
+Epoch 1/20 (RESNET)
+Train Loss: 0.2965, Train Acc: 0.8725
+Val Loss: 0.2106, Val Acc: 0.9092
+Val Precision: 0.9665, Val Recall: 0.8911
+Val F1: 0.9272, Val AUC: 0.9718
+Saved best resnet model with Val Loss: 0.2106
+Training resnet Epoch 2: 100%|██████████| 711/711 [00:35<00:00, 19.76it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 20.04it/s]
+Epoch 2/20 (RESNET)
+Train Loss: 0.2289, Train Acc: 0.9017
+Val Loss: 0.1978, Val Acc: 0.9046
+Val Precision: 0.9770, Val Recall: 0.8737
+Val F1: 0.9225, Val AUC: 0.9757
+Saved best resnet model with Val Loss: 0.1978
+Training resnet Epoch 3: 100%|██████████| 711/711 [00:35<00:00, 20.11it/s]
+Validating resnet: 100%|██████████| 178/178 [00:09<00:00, 19.62it/s]
+Epoch 3/20 (RESNET)
+Train Loss: 0.2094, Train Acc: 0.9063
+Val Loss: 0.1965, Val Acc: 0.9131
+Val Precision: 0.9706, Val Recall: 0.8932
+Val F1: 0.9303, Val AUC: 0.9756
+Saved best resnet model with Val Loss: 0.1965
+Training resnet Epoch 4: 100%|██████████| 711/711 [00:35<00:00, 20.15it/s]
+Validating resnet: 100%|██████████| 178/178 [00:09<00:00, 19.71it/s]
+Epoch 4/20 (RESNET)
+Train Loss: 0.1984, Train Acc: 0.9141
+Val Loss: 0.1875, Val Acc: 0.9177
+Val Precision: 0.9775, Val Recall: 0.8938
+Val F1: 0.9337, Val AUC: 0.9786
+Saved best resnet model with Val Loss: 0.1875
+Training resnet Epoch 5: 100%|██████████| 711/711 [00:35<00:00, 20.17it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 19.85it/s]
+Epoch 5/20 (RESNET)
+Train Loss: 0.1890, Train Acc: 0.9191
+Val Loss: 0.1890, Val Acc: 0.9286
+Val Precision: 0.9644, Val Recall: 0.9241
+Val F1: 0.9438, Val AUC: 0.9776
+Training resnet Epoch 6: 100%|██████████| 711/711 [00:35<00:00, 20.04it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 20.49it/s]
+Epoch 6/20 (RESNET)
+Train Loss: 0.1820, Train Acc: 0.9244
+Val Loss: 0.1618, Val Acc: 0.9324
+Val Precision: 0.9715, Val Recall: 0.9230
+Val F1: 0.9466, Val AUC: 0.9832
+Saved best resnet model with Val Loss: 0.1618
+Training resnet Epoch 7: 100%|██████████| 711/711 [00:35<00:00, 20.27it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 20.15it/s]
+Epoch 7/20 (RESNET)
+Train Loss: 0.1668, Train Acc: 0.9265
+Val Loss: 0.1831, Val Acc: 0.9113
+Val Precision: 0.9807, Val Recall: 0.8808
+Val F1: 0.9280, Val AUC: 0.9809
+Training resnet Epoch 8: 100%|██████████| 711/711 [00:36<00:00, 19.51it/s]
+Validating resnet: 100%|██████████| 178/178 [00:09<00:00, 19.59it/s]
+Epoch 8/20 (RESNET)
+Train Loss: 0.1631, Train Acc: 0.9271
+Val Loss: 0.1818, Val Acc: 0.9208
+Val Precision: 0.9776, Val Recall: 0.8986
+Val F1: 0.9365, Val AUC: 0.9787
+Training resnet Epoch 9: 100%|██████████| 711/711 [00:36<00:00, 19.57it/s]
+Validating resnet: 100%|██████████| 178/178 [00:09<00:00, 19.34it/s]
+Epoch 9/20 (RESNET)
+Train Loss: 0.1644, Train Acc: 0.9288
+Val Loss: 0.1638, Val Acc: 0.9261
+Val Precision: 0.9750, Val Recall: 0.9095
+Val F1: 0.9411, Val AUC: 0.9825
+Training resnet Epoch 10: 100%|██████████| 711/711 [00:35<00:00, 19.89it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 19.83it/s]
+Epoch 10/20 (RESNET)
+Train Loss: 0.1555, Train Acc: 0.9325
+Val Loss: 0.1671, Val Acc: 0.9279
+Val Precision: 0.9696, Val Recall: 0.9176
+Val F1: 0.9429, Val AUC: 0.9827
+Training resnet Epoch 11: 100%|██████████| 711/711 [00:35<00:00, 19.98it/s]
+Validating resnet: 100%|██████████| 178/178 [00:09<00:00, 19.78it/s]
+Epoch 11/20 (RESNET)
+Train Loss: 0.1533, Train Acc: 0.9334
+Val Loss: 0.1647, Val Acc: 0.9303
+Val Precision: 0.9807, Val Recall: 0.9106
+Val F1: 0.9444, Val AUC: 0.9838
+Training resnet Epoch 12: 100%|██████████| 711/711 [00:35<00:00, 20.02it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 19.79it/s]
+Epoch 12/20 (RESNET)
+Train Loss: 0.1466, Train Acc: 0.9365
+Val Loss: 0.1716, Val Acc: 0.9310
+Val Precision: 0.9752, Val Recall: 0.9171
+Val F1: 0.9453, Val AUC: 0.9821
+Training resnet Epoch 13: 100%|██████████| 711/711 [00:35<00:00, 20.28it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 19.97it/s]
+Epoch 13/20 (RESNET)
+Train Loss: 0.1209, Train Acc: 0.9492
+Val Loss: 0.1443, Val Acc: 0.9360
+Val Precision: 0.9685, Val Recall: 0.9317
+Val F1: 0.9497, Val AUC: 0.9872
+Saved best resnet model with Val Loss: 0.1443
+Training resnet Epoch 14: 100%|██████████| 711/711 [00:35<00:00, 20.08it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 19.99it/s]
+Epoch 14/20 (RESNET)
+Train Loss: 0.1124, Train Acc: 0.9527
+Val Loss: 0.1418, Val Acc: 0.9374
+Val Precision: 0.9810, Val Recall: 0.9214
+Val F1: 0.9503, Val AUC: 0.9876
+Saved best resnet model with Val Loss: 0.1418
+Training resnet Epoch 15: 100%|██████████| 711/711 [00:35<00:00, 19.88it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 20.00it/s]
+Epoch 15/20 (RESNET)
+Train Loss: 0.1065, Train Acc: 0.9537
+Val Loss: 0.1393, Val Acc: 0.9388
+Val Precision: 0.9772, Val Recall: 0.9274
+Val F1: 0.9516, Val AUC: 0.9877
+Saved best resnet model with Val Loss: 0.1393
+Training resnet Epoch 16: 100%|██████████| 711/711 [00:34<00:00, 20.36it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 19.91it/s]
+Epoch 16/20 (RESNET)
+Train Loss: 0.1016, Train Acc: 0.9586
+Val Loss: 0.1395, Val Acc: 0.9398
+Val Precision: 0.9729, Val Recall: 0.9333
+Val F1: 0.9527, Val AUC: 0.9879
+Training resnet Epoch 17: 100%|██████████| 711/711 [00:35<00:00, 20.24it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 19.86it/s]
+Epoch 17/20 (RESNET)
+Train Loss: 0.0956, Train Acc: 0.9585
+Val Loss: 0.1330, Val Acc: 0.9441
+Val Precision: 0.9709, Val Recall: 0.9420
+Val F1: 0.9563, Val AUC: 0.9890
+Saved best resnet model with Val Loss: 0.1330
+Training resnet Epoch 18: 100%|██████████| 711/711 [00:35<00:00, 20.06it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 20.21it/s]
+Epoch 18/20 (RESNET)
+Train Loss: 0.0954, Train Acc: 0.9576
+Val Loss: 0.1326, Val Acc: 0.9437
+Val Precision: 0.9801, Val Recall: 0.9322
+Val F1: 0.9556, Val AUC: 0.9893
+Saved best resnet model with Val Loss: 0.1326
+Training resnet Epoch 19: 100%|██████████| 711/711 [00:35<00:00, 19.83it/s]
+Validating resnet: 100%|██████████| 178/178 [00:08<00:00, 19.92it/s]
+Epoch 19/20 (RESNET)
+Train Loss: 0.0880, Train Acc: 0.9636
+Val Loss: 0.1443, Val Acc: 0.9416
+Val Precision: 0.9698, Val Recall: 0.9393
+Val F1: 0.9543, Val AUC: 0.9882
+Training resnet Epoch 20: 100%|██████████| 711/711 [00:35<00:00, 20.18it/s]
+Validating resnet: 100%|██████████| 178/178 [00:09<00:00, 19.71it/s]
+Epoch 20/20 (RESNET)
+Train Loss: 0.0932, Train Acc: 0.9595
+Val Loss: 0.1318, Val Acc: 0.9433
+Val Precision: 0.9795, Val Recall: 0.9322
+Val F1: 0.9553, Val AUC: 0.9894
+Saved best resnet model with Val Loss: 0.1318
+
+=== Evaluation Phase ===
+
+Evaluating swin: 100%|██████████| 63/63 [00:05<00:00, 11.95it/s]
+
+Confusion Matrix (SWIN):
+[[480  20]
+ [ 53 447]]
+
+Metrics with default threshold (0.5) for SWIN:
+Accuracy: 0.9270
+Precision: 0.9572
+Recall: 0.8940
+F1 Score: 0.9245
+AUC-ROC: 0.9817
+
+Performance at different thresholds (SWIN):
+Threshold	Accuracy	Precision	Recall	F1 Score
+----------------------------------------------------------------------
+0.3		0.9280		0.9297		0.9260	0.9279
+0.4		0.9320		0.9463		0.9160	0.9309
+0.5		0.9270		0.9572		0.8940	0.9245
+0.6		0.9270		0.9692		0.8820	0.9236
+0.7		0.9280		0.9777		0.8760	0.9241
+
+Best threshold for SWIN: 0.4 with F1=0.9309
+Evaluating resnet: 100%|██████████| 63/63 [00:01<00:00, 45.76it/s]
+
+Confusion Matrix (RESNET):
+[[479  21]
+ [ 51 449]]
+
+Metrics with default threshold (0.5) for RESNET:
+Accuracy: 0.9280
+Precision: 0.9553
+Recall: 0.8980
+F1 Score: 0.9258
+AUC-ROC: 0.9840
+
+Performance at different thresholds (RESNET):
+Threshold	Accuracy	Precision	Recall	F1 Score
+----------------------------------------------------------------------
+0.3		0.9310		0.9354		0.9260	0.9307
+0.4		0.9290		0.9441		0.9120	0.9278
+0.5		0.9280		0.9553		0.8980	0.9258
+0.6		0.9260		0.9610		0.8880	0.9231
+0.7		0.9310		0.9736		0.8860	0.9277
+
+Best threshold for RESNET: 0.3 with F1=0.9307
+
+McNemar's Test (Swin vs. ResNet): p-value = 1.0000
+No significant difference between Swin and ResNet predictions.
+
+=== Final Model Performance ===
+
+SWIN Default threshold (0.5):
+  accuracy: 0.9270
+  precision: 0.9572
+  recall: 0.8940
+  f1_score: 0.9245
+  auc_roc: 0.9817
+  threshold: 0.5000
+
+SWIN Optimal threshold (0.4):
+  accuracy: 0.9320
+  precision: 0.9463
+  recall: 0.9160
+  f1_score: 0.9309
+  auc_roc: 0.9817
+  threshold: 0.4000
+
+RESNET Default threshold (0.5):
+  accuracy: 0.9280
+  precision: 0.9553
+  recall: 0.8980
+  f1_score: 0.9258
+  auc_roc: 0.9840
+  threshold: 0.5000
+
+RESNET Optimal threshold (0.3):
+  accuracy: 0.9310
+  precision: 0.9354
+  recall: 0.9260
+  f1_score: 0.9307
+  auc_roc: 0.9840
+  threshold: 0.3000
+
+Melanoma classification completed successfully!
